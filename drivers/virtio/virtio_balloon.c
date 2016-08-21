@@ -31,6 +31,9 @@
 #include <linux/wait.h>
 #include <linux/mm.h>
 #include <linux/mount.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#include <linux/types.h>
 
 /*
  * Balloon device works in 4K page units.  So each page is pointed to by
@@ -87,6 +90,9 @@ struct virtio_balloon {
 
 	/* To register callback in oom notifier call chain */
 	struct notifier_block nb;
+
+    /* BPF program for collection of statistics */
+    struct bpf_prog *stats_prog;
 };
 
 static struct virtio_device_id id_table[] = {
@@ -265,6 +271,7 @@ static void update_balloon_stats(struct virtio_balloon *vb)
 				pages_to_bytes(i.totalram));
 	update_stat(vb, idx++, VIRTIO_BALLOON_S_AVAIL,
 				pages_to_bytes(available));
+    update_stat(vb, idx++, VIRTIO_BALLOON_S_BPF_RET, BPF_PROG_RUN(vb->stats_prog, (void *)events));
 }
 
 /*
@@ -517,10 +524,39 @@ static struct file_system_type balloon_fs = {
 
 #endif /* CONFIG_BALLOON_COMPACTION */
 
+static int stats_prog_init(struct virtio_balloon *vb, struct bpf_insn *insns, size_t size)
+{
+    int err = 0;
+    unsigned int len = size / sizeof(struct bpf_insn);
+
+    vb->stats_prog = bpf_prog_alloc(bpf_prog_size(len), 0);
+    if (!vb->stats_prog) {
+        err = -ENOMEM;
+        goto out;
+    }
+
+    vb->stats_prog->len = len;
+    vb->stats_prog->type = BPF_PROG_TYPE_SOCKET_FILTER;
+
+    memcpy(vb->stats_prog->insnsi, insns, size);
+
+    bpf_prog_select_runtime(vb->stats_prog, &err);
+    if (err) 
+        bpf_prog_free(vb->stats_prog);
+
+out:
+    return err;
+}
+
 static int virtballoon_probe(struct virtio_device *vdev)
 {
 	struct virtio_balloon *vb;
 	int err;
+    struct bpf_insn stats_prog_insns[] = {
+        BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_1, PGMAJFAULT * sizeof(unsigned long)),
+        //BPF_ALU64_IMM(BPF_LSH, BPF_REG_0, 12),
+        BPF_EXIT_INSN()
+    };
 
 	if (!vdev->config->get) {
 		dev_err(&vdev->dev, "%s failure: config access disabled\n",
@@ -577,6 +613,8 @@ static int virtballoon_probe(struct virtio_device *vdev)
 
 	virtio_device_ready(vdev);
 
+    printk("virtio_balloon: stats_prog_init: %d\n", stats_prog_init(vb, stats_prog_insns, sizeof(stats_prog_insns))); 
+
 	return 0;
 
 out_del_vqs:
@@ -600,9 +638,16 @@ static void remove_common(struct virtio_balloon *vb)
 	vb->vdev->config->del_vqs(vb->vdev);
 }
 
+static void stats_prog_remove(struct virtio_balloon *vb)
+{
+    bpf_prog_free(vb->stats_prog); 
+}
+
 static void virtballoon_remove(struct virtio_device *vdev)
 {
 	struct virtio_balloon *vb = vdev->priv;
+
+    stats_prog_remove(vb);
 
 	unregister_oom_notifier(&vb->nb);
 
