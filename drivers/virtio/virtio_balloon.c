@@ -91,12 +91,14 @@ struct virtio_balloon {
 	/* To register callback in oom notifier call chain */
 	struct notifier_block nb;
 
-    /* BPF program for collection of statistics */
-    struct bpf_prog *stats_prog;
+	/* BPF program for collection of statistics */
+	struct bpf_prog *stats_prog;
 
-    unsigned int stats_prog_order;
+	/* BPF instructions buffer size order */
+	unsigned int stats_prog_order;
 
-    unsigned long stats_prog_insns;
+	/* BPF instructions buffer for loading from host */
+	struct bpf_insn *stats_prog_insns;
 };
 
 static struct virtio_device_id id_table[] = {
@@ -541,12 +543,9 @@ static int stats_prog_init(struct virtio_balloon *vb)
         goto out;
     }
     
-    virtio_cread(vb->vdev, struct virtio_balloon_config, stats_prog_len, &len);  
-
-    printk("virtio_balloon: len=%u\n", len);
-
-    size = len * sizeof(struct bpf_insn);
-    printk("virtio_balloon: size=%u\n", size);
+    virtio_cread(vb->vdev, struct virtio_balloon_config, stats_prog_size, &size);  
+    len = size / sizeof(struct bpf_insn);
+    printk("virtio_balloon: size=%u, len=%u\n", size, len);
 
     if (size <= PAGE_SIZE * 1)
         vb->stats_prog_order = 0;
@@ -561,19 +560,23 @@ static int stats_prog_init(struct virtio_balloon *vb)
  
     printk("virtio_balloon: order=%u\n", vb->stats_prog_order);
 
-    vb->stats_prog_insns = __get_free_pages(GFP_KERNEL, vb->stats_prog_order);
+    vb->stats_prog_insns = (struct bpf_insn *)__get_free_pages(GFP_KERNEL, vb->stats_prog_order);
     if (!vb->stats_prog_insns) {
         err = -ENOMEM;
         goto out;
     }
     printk("virtio_balloon: insns=%p\n", vb->stats_prog_insns);
-
-    ((struct bpf_insn *)vb->stats_prog_insns)[0] = BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_1, PGMAJFAULT * sizeof(unsigned long));
-    ((struct bpf_insn *)vb->stats_prog_insns)[1] = BPF_EXIT_INSN();
+    //vb->stats_prog_insns[0] = BPF_LDX_MEM(BPF_W, BPF_REG_0, BPF_REG_1, PGMAJFAULT * sizeof(unsigned long));
+    
+    vb->stats_prog_insns[0] = BPF_EXIT_INSN();
     pfn = virt_to_phys(vb->stats_prog_insns) >> PAGE_SHIFT;
     printk("virtio_balloon: pfn=%p\n", pfn);
     
     virtio_cwrite(vb->vdev, struct virtio_balloon_config, stats_prog_pfn, &pfn);    
+
+    int i;
+    for (i = 0; i < len; ++i)
+        printk("virtio_balloon: 0x%.lx\n", vb->stats_prog_insns[i]);
 
     vb->stats_prog = bpf_prog_alloc(bpf_prog_size(len), 0);
     if (!vb->stats_prog) {
@@ -584,7 +587,7 @@ static int stats_prog_init(struct virtio_balloon *vb)
     vb->stats_prog->len = len;
     vb->stats_prog->type = BPF_PROG_TYPE_SOCKET_FILTER;
 
-    memcpy(vb->stats_prog->insnsi, (struct bpf_insns *)vb->stats_prog_insns, size);
+    memcpy(vb->stats_prog->insnsi, vb->stats_prog_insns, size);
 
     bpf_prog_select_runtime(vb->stats_prog, &err);
     if (err) {
@@ -597,7 +600,7 @@ static int stats_prog_init(struct virtio_balloon *vb)
 out_free_prog:
     bpf_prog_free(vb->stats_prog);
 out_free_insns:
-    free_pages(vb->stats_prog_insns, vb->stats_prog_order);
+    free_pages((unsigned long)vb->stats_prog_insns, vb->stats_prog_order);
 out:
     return err;
 }
@@ -690,7 +693,7 @@ static void remove_common(struct virtio_balloon *vb)
 static void stats_prog_remove(struct virtio_balloon *vb)
 {
     bpf_prog_free(vb->stats_prog);
-    free_pages(vb->stats_prog_insns, vb->stats_prog_order);
+    free_pages((unsigned long)vb->stats_prog_insns, vb->stats_prog_order);
 }
 
 static void virtballoon_remove(struct virtio_device *vdev)
