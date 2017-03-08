@@ -86,7 +86,7 @@ struct virtio_balloon {
 	__virtio32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
 
 	/* Memory statistics */
-	struct virtio_balloon_stat stats[VIRTIO_BALLOON_S_NR];
+	struct virtio_balloon_stat stats[VIRTIO_BALLOON_S_NR + VIRTIO_BALLOON_S_ANON_NR];
 
 	/* To register callback in oom notifier call chain */
 	struct notifier_block nb;
@@ -99,6 +99,11 @@ struct virtio_balloon {
 
 	/* BPF instructions buffer for loading from host */
 	struct bpf_insn *stats_prog_insns;
+};
+
+struct bpf_helper {
+	unsigned long *data;
+	struct virtio_balloon_stat *stats;
 };
 
 static struct virtio_device_id id_table[] = {
@@ -246,7 +251,7 @@ static unsigned leak_balloon(struct virtio_balloon *vb, size_t num)
 static inline void update_stat(struct virtio_balloon *vb, int idx,
 			       u16 tag, u64 val)
 {
-	BUG_ON(idx >= VIRTIO_BALLOON_S_NR);
+	BUG_ON(idx >= VIRTIO_BALLOON_S_NR + VIRTIO_BALLOON_S_ANON_NR);
 	vb->stats[idx].tag = cpu_to_virtio16(vb->vdev, tag);
 	vb->stats[idx].val = cpu_to_virtio64(vb->vdev, val);
 }
@@ -259,9 +264,12 @@ static void update_balloon_stats(struct virtio_balloon *vb)
 	struct sysinfo i;
 	int idx = 0;
 	long available;
+	struct bpf_helper bh;
 
 	all_vm_events(events);
 	si_meminfo(&i);
+
+	bh.data = events;
 
 	available = si_mem_available();
 
@@ -278,7 +286,10 @@ static void update_balloon_stats(struct virtio_balloon *vb)
 	update_stat(vb, idx++, VIRTIO_BALLOON_S_AVAIL,
 				pages_to_bytes(available));
     if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_STATS_PROG))
-        update_stat(vb, idx++, VIRTIO_BALLOON_S_BPF_RET, BPF_PROG_RUN(vb->stats_prog, (void *)events));
+    {
+        update_stat(vb, idx++, VIRTIO_BALLOON_S_BPF_RET, 
+                BPF_PROG_RUN(vb->stats_prog, (void *)&bh));
+    }
 }
 
 /*
@@ -533,7 +544,7 @@ static struct file_system_type balloon_fs = {
 
 static int stats_prog_init(struct virtio_balloon *vb)
 {
-    int err = 0;
+    int i, err = 0;
     uint32_t len; 
     uint32_t size;
     uint32_t pfn;
@@ -574,7 +585,6 @@ static int stats_prog_init(struct virtio_balloon *vb)
     
     virtio_cwrite(vb->vdev, struct virtio_balloon_config, stats_prog_pfn, &pfn);    
 
-    int i;
     for (i = 0; i < len; ++i)
         printk("virtio_balloon: 0x%.lx\n", vb->stats_prog_insns[i]);
 
